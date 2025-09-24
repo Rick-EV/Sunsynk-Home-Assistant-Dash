@@ -1186,11 +1186,20 @@ sensor:
 
 ################################################ SAVE RAW REGISTERS ############################################
 
-  - platform: modbus_controller            # 255 Grid Peak Shaving raw register value
+  - platform: modbus_controller            # 280 Grid Peak Shaving raw register value
     modbus_controller_id: inverter
     id: grid_peak_shaving_raw
     register_type: holding
     address: 280
+    value_type: U_WORD
+    internal: true
+    
+  - platform: modbus_controller            # 326 Advanced Function raw register value
+    modbus_controller_id: inverter
+    name: "Energy Meter # Phases Raw"
+    id: energy_meter_phases_raw
+    address: 326
+    register_type: holding
     value_type: U_WORD
     internal: true
 
@@ -1677,6 +1686,18 @@ number:
     max_value: 8000
     step: 500
     value_type: U_WORD
+    
+  - platform: modbus_controller            # 53 Max Solar Power
+    use_write_multiple: true
+    modbus_controller_id: inverter
+    name: "${friendly_name} Max Solar power"
+    id: inverter_max_solar_power
+    address: 53
+    unit_of_measurement: "W"
+    min_value: 0
+    max_value: 12000
+    step: 50
+    value_type: U_WORD
 
 ################################################ TEXT SENSORS ##################################################
 
@@ -1930,6 +1951,34 @@ select:
       // optionsmap should only return 2 values... 0 , 256 so bitmask with complement 0x0100 to ensure we keep the original values in register. Then appply OR with the value that was chosen
       uint16_t modified = ((unmodified & ~0x0100) | value);
       //ESP_LOGE("main","Modbus write to write = %d", modified);
+      return modified;
+      
+  - platform: modbus_controller
+    use_write_multiple: true
+    modbus_controller_id: inverter
+    name: "Energy Meter # Phases"
+    id: energy_meter_phases
+    address: 326
+    value_type: U_WORD
+    optionsmap:
+      "1": 0
+      "3": 12
+    lambda: |-
+      // Mask out bits 2+3
+      uint16_t masked = (x & 0x000C);
+
+      if (masked == 0) {
+        return std::string("1");
+      }
+      if (masked == 12) {
+        return std::string("3");
+      }
+      return {};
+    write_lambda: |-
+      // Preserve all other bits in register 326
+      uint16_t unmodified = id(energy_meter_phases_raw).state;
+      // Clear bits 2+3, then OR with chosen value (0 or 12)
+      uint16_t modified = ((unmodified & ~0x000C) | value);
       return modified;
 
   - platform: modbus_controller            #274 Select Prog1 Charge Option
