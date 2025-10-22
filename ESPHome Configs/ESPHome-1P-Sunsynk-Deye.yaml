@@ -3,7 +3,24 @@ substitutions:
   devicename: "inverter"
   device_description: "Inverter RS485 Logger"
   friendly_name: "SunSynk"
-
+  
+  # Conditional polling intervals (in milliseconds)
+  fast_interval: "5000"     # 5 seconds - active system
+  normal_interval: "10000"  # 10 seconds - low activity
+  standby_interval: "30000" # 30 seconds - minimal activity
+  
+  # Conditional polling thresholds (in Watts)
+  # Fast mode triggers when ANY metric exceeds these values
+  fast_pv_threshold: "500"
+  fast_battery_threshold: "500"
+  fast_load_threshold: "500"
+  fast_grid_threshold: "500"
+  
+  # Normal mode triggers when ANY metric exceeds these values
+  normal_pv_threshold: "250"
+  normal_battery_threshold: "250"
+  normal_load_threshold: "250"
+  
 esphome:
   name: $devicename
   comment: '${device_description}'
@@ -22,6 +39,7 @@ web_server:
   version: 2
   log: false
   ota: false
+  include_internal: false  # Don't expose internal sensors on web UI
 
 # Enable logging
 logger:
@@ -55,6 +73,114 @@ captive_portal:
 time:
   - platform: homeassistant
     id: homeassistant_time
+
+# Globals for conditional polling state management
+globals:
+  - id: is_system_active
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: is_standby_mode
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: current_update_interval
+    type: int
+    restore_value: no
+    initial_value: '10000'  # milliseconds
+
+# Scripts
+script:
+  - id: sync_inverter_time
+    then:
+      - lambda: |-
+          esphome::modbus_controller::ModbusController *controller = id(inverter);
+          time_t now = ::time(nullptr);
+          struct tm *time_info = ::localtime(&now);
+          int seconds = time_info->tm_sec;
+          int minutes = time_info->tm_min;
+          int hour = time_info->tm_hour;
+          int day = time_info->tm_mday;
+          int month = time_info->tm_mon + 1;
+          int year = time_info->tm_year + 1900;
+          int year1 = year - 2000;
+          
+          if (year != 1970) {
+            uint16_t reg22_value = (year1 << 8) | month;
+            uint16_t reg23_value = (day << 8) | hour;
+            uint16_t reg24_value = (minutes << 8) | seconds;
+            std::vector<uint16_t> rtc_data = {reg22_value, reg23_value, reg24_value};
+            esphome::modbus_controller::ModbusCommandItem set_rtc_command =
+                esphome::modbus_controller::ModbusCommandItem::create_write_multiple_command(controller, 22, rtc_data.size(), rtc_data);
+            controller->queue_command(set_rtc_command);
+            ESP_LOGI("Time Sync", "Synced - %02d:%02d:%02d %02d/%02d/%d", hour, minutes, seconds, day, month, year);
+          }
+
+  # Adjust polling rate based on overall inverter activity
+  - id: adjust_polling_rate
+    then:
+      - lambda: |-
+          esphome::modbus_controller::ModbusController *controller = id(inverter);
+          
+          // Get current system state
+          float pv_power = id(inverter_esphome_pv_total).state;
+          float battery_power = abs(id(inverter_esphome_battery_power).state);  // Absolute value for charge/discharge
+          float load_power = id(inverter_esphome_load_power).state;
+          float grid_power = abs(id(inverter_esphome_grid_ct_power).state);  // Absolute value for import/export
+          
+          // Get configurable thresholds and intervals from HA
+          float fast_pv = id(config_fast_pv_threshold).state;
+          float fast_batt = id(config_fast_battery_threshold).state;
+          float fast_load = id(config_fast_load_threshold).state;
+          float fast_grid = id(config_fast_grid_threshold).state;
+          float normal_pv = id(config_normal_pv_threshold).state;
+          float normal_batt = id(config_normal_battery_threshold).state;
+          float normal_load = id(config_normal_load_threshold).state;
+          int fast_int = (int)id(config_fast_interval).state;
+          int normal_int = (int)id(config_normal_interval).state;
+          int standby_int = (int)id(config_standby_interval).state;
+          
+          int new_interval = id(current_update_interval);
+          bool is_active = false;
+          
+          // Determine optimal update interval based on overall system activity
+          // Fast mode: Any significant power flow
+          if (pv_power > fast_pv || 
+              battery_power > fast_batt || 
+              load_power > fast_load || 
+              grid_power > fast_grid) {
+            // Active system - fast updates for responsive monitoring
+            new_interval = fast_int;
+            is_active = true;
+            id(is_system_active) = true;
+            id(is_standby_mode) = false;
+            
+          // Normal mode: Low activity
+          } else if (pv_power > normal_pv || 
+                     battery_power > normal_batt || 
+                     load_power > normal_load) {
+            // Low activity - normal updates
+            new_interval = normal_int;
+            is_active = false;
+            id(is_system_active) = false;
+            id(is_standby_mode) = false;
+            
+          // Standby mode: Minimal activity (cloudy day, night, or very low load)
+          } else {
+            // Standby - slow updates to reduce bus traffic
+            new_interval = standby_int;
+            is_active = false;
+            id(is_system_active) = false;
+            id(is_standby_mode) = true;
+          }
+          
+          // Only update if interval changed
+          if (new_interval != id(current_update_interval)) {
+            id(current_update_interval) = new_interval;
+            controller->set_update_interval(new_interval);
+            ESP_LOGI("Polling", "Update interval: %d ms | PV: %.0fW, Batt: %.0fW, Load: %.0fW, Grid: %.0fW", 
+                     new_interval, pv_power, battery_power, load_power, grid_power);
+          }
      
 uart:
   id: mod_bus
@@ -72,70 +198,45 @@ modbus_controller:
     address: 0x01
     modbus_id: inverter_modbus
     setup_priority: -10
-    update_interval: "15s"
-    command_throttle: "50ms"
+    update_interval: "10s"  # Initial startup value - adjusted dynamically by conditional polling
+    command_throttle: "100ms"  # Increased to reduce bus congestion
+    offline_skip_updates: 3  # Skip updates if device offline
 
 #Set the interval to sync your inverter time with HA or comment out to disable 
 interval:
   - interval: 3600s
     then:
-      - lambda: |-
-          esphome::modbus_controller::ModbusController *controller = id(inverter);
-          time_t now = ::time(nullptr);
-          struct tm *time_info = ::localtime(&now);
-          int seconds = time_info->tm_sec;
-          int minutes = time_info->tm_min;
-          int hour = time_info->tm_hour;
-          int day = time_info->tm_mday;
-          int month = time_info->tm_mon + 1;
-          int year = time_info->tm_year;
-          year = year + 1900;
-          int year1 = year - 2000;
-          
-          uint16_t reg22_value = (year1 << 8) | month;
-          uint16_t reg23_value = (day << 8) | hour;
-          uint16_t reg24_value = (minutes << 8) | seconds;
-          
-          if (year != 1970) {
-            std::vector<uint16_t> rtc_data = {reg22_value, reg23_value, reg24_value};
-            esphome::modbus_controller::ModbusCommandItem set_rtc_command =
-                esphome::modbus_controller::ModbusCommandItem::create_write_multiple_command(controller, 22, rtc_data.size(), rtc_data);
-            controller->queue_command(set_rtc_command);
-            ESP_LOGI("Time Sync", "Seconds: %d, Minutes: %d, Hour: %d, Day: %d, Month: %d, Year: %d", seconds, minutes, hour, day, month, year);
-          }
+      - script.execute: sync_inverter_time
+
+  # Check and adjust polling rate every 60 seconds
+  - interval: 60s
+    then:
+      - script.execute: adjust_polling_rate
+
+############################################### BUTTON  ###############################################
+button:
+  - platform: template
+    name: "${friendly_name} Sync Time"
+    id: sync_time_button
+    icon: "mdi:clock-sync"
+    on_press:
+      - script.execute: sync_inverter_time
 
 ############################################### BINARY SENSORS ########################################
 binary_sensor:
-  - platform: homeassistant            # Manual Time sync. Create an input_boolean sensor in HA
-    entity_id: input_boolean.sync_inverter_time
-    name: "Sync Time"
-    id: sync_time
-    on_press:
-      then:
-        - lambda: |-
-            esphome::modbus_controller::ModbusController *controller = id(inverter);
-            time_t now = ::time(nullptr);
-            struct tm *time_info = ::localtime(&now);
-            int seconds = time_info->tm_sec;
-            int minutes = time_info->tm_min;
-            int hour = time_info->tm_hour;
-            int day = time_info->tm_mday;
-            int month = time_info->tm_mon + 1;
-            int year = time_info->tm_year;
-            year = year + 1900;
-            int year1 = year - 2000;
-            
-            uint16_t reg22_value = (year1 << 8) | month;
-            uint16_t reg23_value = (day << 8) | hour;
-            uint16_t reg24_value = (minutes << 8) | seconds;
-            
-            if (year != 1970) {
-              std::vector<uint16_t> rtc_data = {reg22_value, reg23_value, reg24_value};
-              esphome::modbus_controller::ModbusCommandItem set_rtc_command =
-                  esphome::modbus_controller::ModbusCommandItem::create_write_multiple_command(controller, 22, rtc_data.size(), rtc_data);
-              controller->queue_command(set_rtc_command);
-              ESP_LOGI("Time Sync", "Seconds: %d, Minutes: %d, Hour: %d, Day: %d, Month: %d, Year: %d", seconds, minutes, hour, day, month, year);
-            }
+  - platform: template
+    name: "${friendly_name} System Active"
+    id: system_active_sensor
+    icon: "mdi:lightning-bolt"
+    lambda: |-
+      return id(is_system_active);
+
+  - platform: template
+    name: "${friendly_name} Standby Mode"
+    id: standby_mode_sensor
+    icon: "mdi:power-sleep"
+    lambda: |-
+      return id(is_standby_mode);
 
   - platform: modbus_controller            # 194 Grid Connected Status
     modbus_controller_id: inverter
@@ -203,7 +304,13 @@ sensor:
     unit_of_measurement: "%"
     accuracy_decimals: 0
     device_class: battery
+    state_class: measurement
     value_type: U_WORD
+    filters:
+      - clamp:
+          min_value: 0
+          max_value: 100
+          ignore_out_of_range: true
 
   - platform: modbus_controller            # 190 Battery Power
     modbus_controller_id: inverter
@@ -782,7 +889,7 @@ sensor:
     state_class: measurement
     lambda: |-
       return (id(inverter_esphome_pv1_power).state + id(inverter_esphome_pv2_power).state);
-    update_interval: 5s
+ 
     
   #- platform: template                     # Sum of PV1, PV2 and PV3 to get total PV Power
   #  name: "${friendly_name} Solar Power"
@@ -793,7 +900,7 @@ sensor:
   #  state_class: measurement
   #  lambda: |-
   #    return (id(inverter_esphome_pv1_power).state + id(inverter_esphome_pv2_power).state + id(inverter_esphome_pv3_power).state);
-  #  update_interval: 5s
+
 
 ############################################### OUTPUTS ###############################################
 
@@ -817,7 +924,7 @@ sensor:
     state_class: measurement
     lambda: |-
       return (id(inverter_esphome_inverter_power).state + id(inverter_esphome_grid_power_l1_167).state - id(inverter_esphome_aux_power).state);
-    update_interval: 5s
+ 
 
   - platform: template                     # Essential Power1 based on register 175 + 169 - 166
     name: "${friendly_name} Essential Power 1"
@@ -827,7 +934,7 @@ sensor:
     state_class: measurement
     lambda: |-
       return (id(inverter_esphome_inverter_power).state + id(inverter_esphome_grid_power_169).state - id(inverter_esphome_aux_power).state);
-    update_interval: 5s
+
 
   - platform: template                     # Nonessential Power 172 - 167
     name: "${friendly_name} Nonessential Power"
@@ -837,7 +944,7 @@ sensor:
     state_class: measurement
     lambda: |-
       return (id(inverter_esphome_grid_ct_power).state - id(inverter_esphome_grid_power_l1_167).state);
-    update_interval: 5s
+
 
   - platform: template                     # Nonessential Power1 172 - 169
     name: "${friendly_name} Nonessential Power 1"
@@ -847,7 +954,7 @@ sensor:
     state_class: measurement
     lambda: |-
       return (id(inverter_esphome_grid_ct_power).state - id(inverter_esphome_grid_power_169).state);
-    update_interval: 5s
+
 
 
 ############################################### ENERGY ################################################
@@ -1019,6 +1126,19 @@ sensor:
     filters:
       - multiply: 0.1
     value_type: U_WORD
+
+############################################### ESP32 DIAGNOSTIC SENSORS ############################################
+# Monitor ESP32 health and performance
+
+  - platform: template
+    name: "${friendly_name} Polling Interval"
+    id: polling_interval_sensor
+    unit_of_measurement: "ms"
+    accuracy_decimals: 0
+    icon: "mdi:timer"
+    lambda: |-
+      return id(current_update_interval);
+    update_interval: 60s
 
 ############################################### OPTIONAL LOCAL ENERGY SENSORS ############################################
 ##### Calculates daily energy instead of relying on the inverter registers
@@ -1246,19 +1366,19 @@ sensor:
     modbus_controller_id: inverter
     id: reg_16_raw
     register_type: holding
+    skip_updates: ${settings_skipped_updates}
     address: 16
     value_type: U_WORD
     internal: true
-    skip_updates: ${settings_skipped_updates}
 
   - platform: modbus_controller            # 17 raw register value
     modbus_controller_id: inverter
     id: reg_17_raw
     register_type: holding
+    skip_updates: ${settings_skipped_updates}
     address: 17
     value_type: U_WORD
     internal: true
-    skip_updates: ${settings_skipped_updates}
 
 ################################################ WRITE SETTINGS ############################################
 
@@ -1677,6 +1797,140 @@ number:
     max_value: 8000
     step: 500
     value_type: U_WORD
+
+# Number entities for runtime configuration (adjustable from Home Assistant)
+  # Polling intervals
+  - platform: template
+    name: "${friendly_name} Fast Interval"
+    id: config_fast_interval
+    icon: "mdi:timer-fast"
+    optimistic: true
+    min_value: 3000
+    max_value: 15000
+    step: 1000
+    initial_value: ${fast_interval}
+    unit_of_measurement: "ms"
+    mode: box
+    restore_value: true
+
+  - platform: template
+    name: "${friendly_name} Normal Interval"
+    id: config_normal_interval
+    icon: "mdi:timer"
+    optimistic: true
+    min_value: 5000
+    max_value: 30000
+    step: 1000
+    initial_value: ${normal_interval}
+    unit_of_measurement: "ms"
+    mode: box
+    restore_value: true
+
+  - platform: template
+    name: "${friendly_name} Standby Interval"
+    id: config_standby_interval
+    icon: "mdi:timer-sand"
+    optimistic: true
+    min_value: 15000
+    max_value: 120000
+    step: 5000
+    initial_value: ${standby_interval}
+    unit_of_measurement: "ms"
+    mode: box
+    restore_value: true
+
+  # Fast mode thresholds
+  - platform: template
+    name: "${friendly_name} Fast PV Threshold"
+    id: config_fast_pv_threshold
+    icon: "mdi:solar-power"
+    optimistic: true
+    min_value: 50
+    max_value: 2000
+    step: 50
+    initial_value: ${fast_pv_threshold}
+    unit_of_measurement: "W"
+    mode: box
+    restore_value: true
+
+  - platform: template
+    name: "${friendly_name} Fast Battery Threshold"
+    id: config_fast_battery_threshold
+    icon: "mdi:battery-charging"
+    optimistic: true
+    min_value: 50
+    max_value: 3000
+    step: 50
+    initial_value: ${fast_battery_threshold}
+    unit_of_measurement: "W"
+    mode: box
+    restore_value: true
+
+  - platform: template
+    name: "${friendly_name} Fast Load Threshold"
+    id: config_fast_load_threshold
+    icon: "mdi:home-lightning-bolt"
+    optimistic: true
+    min_value: 100
+    max_value: 5000
+    step: 100
+    initial_value: ${fast_load_threshold}
+    unit_of_measurement: "W"
+    mode: box
+    restore_value: true
+
+  - platform: template
+    name: "${friendly_name} Fast Grid Threshold"
+    id: config_fast_grid_threshold
+    icon: "mdi:transmission-tower"
+    optimistic: true
+    min_value: 50
+    max_value: 3000
+    step: 50
+    initial_value: ${fast_grid_threshold}
+    unit_of_measurement: "W"
+    mode: box
+    restore_value: true
+
+  # Normal mode thresholds
+  - platform: template
+    name: "${friendly_name} Normal PV Threshold"
+    id: config_normal_pv_threshold
+    icon: "mdi:solar-power"
+    optimistic: true
+    min_value: 10
+    max_value: 1000
+    step: 10
+    initial_value: ${normal_pv_threshold}
+    unit_of_measurement: "W"
+    mode: box
+    restore_value: true
+
+  - platform: template
+    name: "${friendly_name} Normal Battery Threshold"
+    id: config_normal_battery_threshold
+    icon: "mdi:battery"
+    optimistic: true
+    min_value: 10
+    max_value: 1000
+    step: 10
+    initial_value: ${normal_battery_threshold}
+    unit_of_measurement: "W"
+    mode: box
+    restore_value: true
+
+  - platform: template
+    name: "${friendly_name} Normal Load Threshold"
+    id: config_normal_load_threshold
+    icon: "mdi:home-lightning-bolt-outline"
+    optimistic: true
+    min_value: 50
+    max_value: 2000
+    step: 50
+    initial_value: ${normal_load_threshold}
+    unit_of_measurement: "W"
+    mode: box
+    restore_value: true
 
 ################################################ TEXT SENSORS ##################################################
 
